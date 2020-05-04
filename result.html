@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <!-- Required meta tags -->
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+
+    <!-- Bootstrap CSS -->
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.4.1/css/bootstrap.min.css" integrity="sha384-Vkoo8x4CGsO3+Hhxv8T/Q5PaXtkKtu6ug5TOeNV6gBiFeWPGFN9MuhOf23Q9Ifjh" crossorigin="anonymous">
+
+    <title>Contract Monitor - Dashboard</title>
+  </head>
+  <body>
+    <div class="container-fluid">
+      <main role="main" class="col-md-9 ml-5 col-lg-10 px-1">
+        <h1>Contract Monitor - Dashboard</h1>
+        
+        <h3>Live monitoring</h3>
+        <table class="table table-striped table-sm">
+          <thead>
+              <tr>
+                  <th>Tx hash</th>
+                  <th>From</th>
+                  <th>To</th>
+                  <th>Block #</th>
+                  <th>Value (ETH)</th>
+              </tr>
+          </thead>
+          <tbody id="liveTable">        
+          </tbody>
+        </table>
+
+        <div id="loaderContainer">
+          <p>
+          </p>
+        </div>
+
+        <h3>All past transactions</h3>
+
+        <table class="table table-striped table-sm">
+            <thead>
+                <tr>
+                    <th>Tx hash</th>
+                    <th>From</th>
+                    <th>To</th>
+                    <th>Block #</th>
+                    <th>Value (ETH)</th>
+                </tr>
+            </thead>
+            <tbody id="historyTable">        
+            </tbody>
+        </table>
+        <div id="historyTableStatus"></div>
+      </main>
+    </div>
+
+
+    <script src="https://code.jquery.com/jquery-3.4.1.slim.min.js" integrity="sha384-J6qa4849blE2+poT4WnyKhv5vZF5SrPo0iEjwBvKU7imGFAV0wwj1yYfoRSJoZ+n" crossorigin="anonymous"></script>
+    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.4.1/js/bootstrap.min.js" integrity="sha384-wfSDF2E50Y2D1uUdj0O3uMBJnjuUD4Ih7YwaYd1iqfktj0Uod8GCExl3Og8ifwB6" crossorigin="anonymous"></script>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.3.1/jquery.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/2.3.0/socket.io.js"></script>
+    
+
+
+    <script>
+      var contract = { chash: getSearchParams("chash") };
+      
+      // 1. ajax request to fetch historical data
+      $.ajax({
+        method: 'GET',
+        url: 'getHistory',
+        data: contract,
+        success: function(res, textStatus, jqXHR) {
+          if (jqXHR.status == 204) {
+            var text = `<h6>Too many transactions to display</h6>`;
+            document.getElementById('historyTableStatus').innerHTML += text;
+          } else {
+            console.log(res);
+            buildHistoryTable(res);
+          }
+
+        },
+        error: function (jqXHR, textStatus, errorThrown) {
+          alert("Cannot load contract information - Please check if the contract hash is valid (status: " + jqXHR.status + ")");
+          // 404 if invalid contract hash
+        }
+      })
+      
+      // 2. socket.io for live monitoring / updates
+      const socket = io.connect('/', {'sync disconnect on unload': true });
+      
+      socket.on('hi', (data) => {
+        socket.emit('contract', contract);
+      });
+    
+      socket.on('monitoring start', () => {
+        console.log('live monitoring');
+        var loader = `<div class="spinner-border m-5" role="status">
+                        <span class="sr-only">Loading...</span>
+                      </div>`;
+        document.getElementById('loaderContainer').innerHTML += loader; 
+      });
+
+      socket.on('new tx', (data) => {
+        addLiveUpdate(data.message);
+      });
+      
+      // useful functions
+      //
+      function addLiveUpdate(data) {
+        var table = document.getElementById('liveTable');
+        var row = `<tr>
+                    <td>${data.hash}</td>
+                    <td>${data.from}</td>
+                    <td>${data.to}</td>
+                    <td>${data.blockNumber}</td>
+                    <td>${data.value}</td>
+                  </tr>`;
+        table.innerHTML += row;
+      }
+
+      function buildHistoryTable(data) {
+        var table = document.getElementById('historyTable');
+        for (var i = data.length - 1; i >= 0; i--) {
+          var row = `<tr>
+                        <td>${data[i].hash}</td>
+                        <td>${data[i].from}</td>
+                        <td>${data[i].to}</td>
+                        <td>${data[i].blockNumber}</td>
+                        <td>${data[i].value}</td>
+                    </tr>`;
+          table.innerHTML += row;
+        }
+      }
+      function getSearchParams(k) {
+        var p = {};
+        location.search.replace(/[?&]+([^=&]+)=([^&]*)/gi, function(s,k,v) {p[k]=v})
+        return k?p[k]:p;
+      }
+    </script>
+
+    </body>
+</html>
+
+
