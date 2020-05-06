@@ -12,7 +12,7 @@ const web3 = new Web3(rpcURL);
 const abi = [{"constant":true,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"payable":false,"type":"function"},{"constant":false,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[],"payable":false,"type":"function"},{"constant":true,"inputs":[],"name":"totalSupply","outputs":[{"name":"","type":"uint256"}],"payable":false,"type":"function"},{"constant":false,"inputs":[{"name":"_from","type":"address"},{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transferFrom","outputs":[],"payable":false,"type":"function"},{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint256"}],"payable":false,"type":"function"},{"constant":true,"inputs":[{"name":"_who","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"payable":false,"type":"function"},{"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"payable":false,"type":"function"},{"constant":false,"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[],"payable":false,"type":"function"},{"constant":true,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"remaining","type":"uint256"}],"payable":false,"type":"function"},{"anonymous":false,"inputs":[{"indexed":true,"name":"from","type":"address"},{"indexed":true,"name":"to","type":"address"},{"indexed":false,"name":"value","type":"uint256"}],"name":"Transfer","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"name":"owner","type":"address"},{"indexed":true,"name":"spender","type":"address"},{"indexed":false,"name":"value","type":"uint256"}],"name":"Approval","type":"event"}];
 
 const ABIDecoder = require('abi-decoder');
-const ABIMap = new Set(); //set of contracts whose ABIs we have in ABIDecoder
+const ABISet = new Set(); //set of contracts whose ABIs we have in ABIDecoder
 
 const getJSON = require('get-json');
 
@@ -55,12 +55,37 @@ function queryDB(contractAddr) {
   });
 }
 
+function contractLoader(abi, contractAddr) {
+  return new Promise((resolve, reject) => {
+    var contract = new web3.eth.Contract(abi, contractAddr);
+    resolve(contract);
+  })
+}
+
+//
+function getHistoryData(contract) {
+  return new Promise((resolve, reject) => {
+    contract.getPastEvents("allEvents", { fromBlock: 0 })
+      .then( (events) => {
+        if (typeof events !== 'undefined') {
+          resolve(events);
+        } else {
+          //console.log("server failed at getting past events");
+          reject(events);
+          res.status(204).end();
+          return;
+        }
+    });
+  })
+}
+
 
 // Responds to a URL query on tx history given a contract hash
 app.get("/getHistory", async (req, res) => {
   var contractAddr = req.query.chash;
 
-  // if in our DB, go straight to DB
+  // try querying our DB first
+  // if exists, simply send data from DB (FIX: UPDATING DB)
   var loadedData;
   try {
     loadedData = await queryDB(contractAddr);
@@ -90,31 +115,21 @@ app.get("/getHistory", async (req, res) => {
     return;
   }
   
-  var contract;
-  try {
-    contract = new web3.eth.Contract(abi, contractAddr);
-  }
-  catch(err) {
-    console.error('Error while loading contract for history', err);
-    return;
-  }
-
-  // here if contract address is valid (but possibly a user address)
-  contract.getPastEvents("allEvents", { 
-    fromBlock: 0 //9991160
-    }, (error, events) => { 
-      //console.log(events);
-      if (typeof events !== 'undefined') {
-        getTransactionData(events, contractAddr, function(results) {
-          res.send(results);
-        });
-      } else {
-        console.log("server failed at getting past events");
-        res.status(204).end();
-        return;
-      }
-  });
+  contractLoader(abi, contractAddr) //load contract
+    .then(contract => getHistoryData(contract)) // get past events from web3
+    .then(events => getTransactionData(events, contractAddr))
+    .then(results => { 
+      res.send(results); 
+      console.log(results.length + ' data sent to front');
+    })
+    .catch((error) => { console.error('Error getting history ' + error); });
+    //{ // populate tx data 
+    //  getTransactionData(events, contractAddr, (results) => { res.send(results); });
+    //});
 });
+
+
+
 
 // Enter tx data into database
 function txToDatabase(tx, contractAddr) {
@@ -135,7 +150,7 @@ function txToDatabase(tx, contractAddr) {
     //ReturnValues: "ALL_OLD"
   };
 
-  docClient.put(entry, function(err, data) {
+  docClient.put(entry, (err, data) => {
     if (err) {
       //console.error("Unable to add item to DB. Error JSON:", JSON.stringify(err, null, 2));
       console.error("Error while adding tx hash: " + tx.hash);
@@ -148,23 +163,100 @@ function txToDatabase(tx, contractAddr) {
   });
 }
 
+function getABI(contractAddr) {
+  if (ABISet.has(contractAddr)) {
+    return;
+  } else {
+    ABISet.add(contractAddr);
+    console.log('etherscan query for ' + contractAddr);
+    return new Promise((resolve, reject) => {
+      getJSON('http://api.etherscan.io/api?module=contract&action=getabi&address=' + contractAddr)
+        .then((response) => {
+          if (response.result != '') {
+            console.log('response from etherscan ' + response + ' ' + response.result);
+            ABIDecoder.addABI(eval(response.result));
+            resolve();
+          } else {
+            console.log('Error while obtaining contract ABI for ' + contractAddr);
+            reject();
+          }
+        })
+        .catch((error) => {
+            console.log('Error while obtaining abi ' + error);
+            reject();
+        });
+    });
+  } 
+}
 
-
-// Given a list of tx hashes,
+// Given a list of contractAddr and "events",
 // removes returns a list of tx data (with duplicates removed)
-async function getTransactionData(events, contractAddr, callback) {
+async function getTransactionData(events, contractAddr) {
 
+  return getABI(contractAddr) //get contract ABI if necessary
+    .then(async () => {
+      // Obtain tx data, disregard duplicates
+      // To fix: Inefficient async structure?
+      var seen = new Map();
+      var seenBlock = new Map(); // blockNumber to timeStamp
+      var output = new Array();
+      for (var i = 0; i < events.length; i++) {
+        if (!seen.has(events[i].transactionHash)) {
+          seen.set(events[i].transactionHash, 1);  
+          
+          var tx = {};
+          await web3.eth.getTransaction(events[i].transactionHash)
+            .then((data) => {
+              tx.input = ABIDecoder.decodeMethod(data.input); // to obtain info about invoked function
+              tx.hash = data.hash;
+              tx.blockNumber = data.blockNumber;
+              tx.from = data.from;
+              tx.to = data.to;
+              tx.txIndex = data.transactionIndex;
+              tx.value = data.value/(10**18);
+            })
+            .then(async () => {
+              if (seenBlock.has(tx.blockNumber)) {
+                tx.timestamp = seenBlock.get(tx.blockNumber);
+              } else {
+                await web3.eth.getBlock(tx.blockNumber)
+                  .then(function(block) {
+                    //console.log(block);
+                    if (block) {
+                      var time = block.timestamp;
+                      var timec = new Date(time*1000);
+                      var timeStamp = timec.toUTCString();
+                      tx.timestamp = timeStamp;
+                      seenBlock.set(tx.blockNumber, timeStamp);
+                    } else {
+                      tx.timestamp = null;
+                    }
+                  }); 
+              }
+              txToDatabase(tx, contractAddr);
+              output.push(tx);
+            });
+        }
+      } // for each event / tx
+      
+      return new Promise((resolve, reject) => {
+        //console.log(output);
+        console.log('here resolving ' + output.length)
+        resolve(output);
+      })
+    })
+}
+  
+  /*
   // Obtain the contract's ABI, if we don't have it already
-  //const ABIDecoder = require('abi-decoder');
-  if (!ABIMap.has(contractAddr)) {
-    ABIMap.add(contractAddr, 1);
+  if (!ABISet.has(contractAddr)) {
+    ABISet.add(contractAddr);
     console.log('etherscan query for ' + contractAddr);
     getJSON('http://api.etherscan.io/api?module=contract&action=getabi&address=' + contractAddr)
       .then(function(response) {
         if (response.result != '') {
           console.log('response from etherscan ' + response + ' ' + response.result);
           ABIDecoder.addABI(eval(response.result));
-          //ABIMap.set(contractAddr, 1);
         } else {
           console.log('Error while obtaining contract ABI for ' + contractAddr);
         }
@@ -173,62 +265,11 @@ async function getTransactionData(events, contractAddr, callback) {
           console.log('error while obtaining abi for ' + contractAddr);
       });  
   }
-  
-  // Obtain tx data, disregard duplicates
-  // To fix: Inefficient async structure?
-  var seen = new Map();
-  var seenBlock = new Map(); // blockNumber to timeStamp
-  var output = new Array();
-  for (var i = 0; i < events.length; i++) {
-    if (!seen.has(events[i].transactionHash)) {
-      seen.set(events[i].transactionHash, 1);  
-      
-      var tx = {};
-      await web3.eth.getTransaction(events[i].transactionHash)
-        .then(function(data) {
-          //console.log(data);
-          //console.log(web3.utils.toAscii(data.input));
-          //console.log(web3.eth.abi.decodeParameter(type, hexString));
-          tx.input = ABIDecoder.decodeMethod(data.input); // to obtain info about invoked function
-          tx.hash = data.hash;
-          tx.blockNumber = data.blockNumber;
-          tx.from = data.from;
-          tx.to = data.to;
-          tx.txIndex = data.transactionIndex;
-          tx.value = data.value/(10**18);
-        })
-        .then(async function() {
-          if (seenBlock.has(tx.blockNumber)) {
-            tx.timestamp = seenBlock.get(tx.blockNumber);
-          } else {
-            await web3.eth.getBlock(tx.blockNumber)
-              .then(function(block) {
-                //console.log(block);
-                if (block) {
-                  var time = block.timestamp;
-                  var timec = new Date(time*1000);
-                  var timeStamp = timec.toUTCString();
-                  tx.timestamp = timeStamp;
-                  seenBlock.set(tx.blockNumber, timeStamp);
-                } else {
-                  tx.timestamp = null;
-                }
-              }); 
-          }
-          txToDatabase(tx, contractAddr);
-          output.push(tx);
-        });
-        //.then(function() {
-        //  done();
-        //});
-    }
-    //function done() {
-    //  console.log(output);
-    //  callback(output);
-    //}
-  }
+  ...
+
   callback(output);
-}
+  */
+
 
 
 // For monitoring live updates on contract events 
