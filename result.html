@@ -69,7 +69,7 @@
         method: 'GET',
         url: 'getHistory',
         data: contract,
-        success: function(res, textStatus, jqXHR) {
+        success: (res, textStatus, jqXHR) => {
           if (jqXHR.status == 204) {
             var text = `<h6>Too many transactions to display</h6>`;
             document.getElementById('historyTableStatus').innerHTML += text;
@@ -78,7 +78,7 @@
             buildHistoryTable(res);
           }
         },
-        error: function (jqXHR, textStatus, errorThrown) {
+        error: (jqXHR, textStatus, errorThrown) => {
           alert("Cannot load contract information - Please check if the contract hash is valid (status: " + jqXHR.status + ")");
           // 404 if invalid contract hash
         }
@@ -91,18 +91,23 @@
         socket.emit('contract', contract);
       });
     
+      var monitoringOn = false; // to prevent multiple loaders from displaying
       socket.on('monitoring start', () => {
         console.log('live monitoring');
-        var loader = `<div class="spinner-border m-5" role="status">
-                        <span class="sr-only">Loading...</span>
-                      </div>`;
-        document.getElementById('loaderContainer').innerHTML += loader; 
+        if (!monitoringOn) {
+          monitoringOn = true;
+          var loader = `<div class="spinner-border m-5" role="status">
+                          <span class="sr-only">Loading...</span>
+                        </div>`;
+          document.getElementById('loaderContainer').innerHTML += loader; 
+        }
       });
 
       socket.on('new tx', (data) => {
         addLiveUpdate(data.message);
       });
       
+      //
       // useful functions
       //
       function addLiveUpdate(data) {
@@ -117,7 +122,6 @@
         table.innerHTML += row;
       }
 
-      
       function buildHistoryTable(data) {
         var table = document.getElementById('historyTable');
         for (var i = data.length - 1; i >= 0; i--) {
@@ -150,10 +154,9 @@
         return output;
       }
       
-
       function getSearchParams(k) {
         var p = {};
-        location.search.replace(/[?&]+([^=&]+)=([^&]*)/gi, function(s,k,v) {p[k]=v})
+        location.search.replace(/[?&]+([^=&]+)=([^&]*)/gi, (s,k,v) => {p[k]=v})
         return k?p[k]:p;
       }
     </script>

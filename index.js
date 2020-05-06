@@ -1,10 +1,11 @@
+// Server setup
 const express = require('express');
 const app = express();
 const http = require('http').Server(app);
 const io = require('socket.io')(http);
-
 const port = process.env.PORT || 9000;
 
+// Web3 and other smart contract tools
 const Web3 = require('web3');
 const rpcURL = "wss://mainnet.infura.io/ws/v3/02432d2e0aaf408189f15435d8fd561e";
 const web3 = new Web3(rpcURL);
@@ -15,10 +16,10 @@ const ABIMap = new Set(); //set of contracts whose ABIs we have in ABIDecoder
 
 const getJSON = require('get-json');
 
-// DB
+// Database
 const AWS = require("aws-sdk");
 AWS.config.update({
-  region: "us-east-1c",
+  region: "us-east-1",
   endpoint: "http://localhost:8000"
 });
 const docClient = new AWS.DynamoDB.DocumentClient({
@@ -27,8 +28,8 @@ const docClient = new AWS.DynamoDB.DocumentClient({
 const table = "Transactions";
 
 
-// Partition key (contractAddr) based query
-// Return all txs if exist
+// Makes a partition key (contractAddr) based query
+// Returns all txs in DB corresponding to the given contract
 function queryDB(contractAddr) {
   var params = {
     TableName : table,
@@ -41,11 +42,11 @@ function queryDB(contractAddr) {
     }
   };
 
-  return new Promise(function(resolve, reject) {
-    docClient.query(params, function(error, data) {
-      if (error) {
+  return new Promise((resolve, reject) => {
+    docClient.query(params, (error, data) => {
+      if (error || data.Count == 0) {
         console.error('DB query failed for contract ' + contractAddr);
-        reject(Error('DB query failed'));
+        reject(Error('DB query caused an error or did not return any results'));
       } else {
         console.log('DB query succeeded.');
         resolve(data);
@@ -55,8 +56,8 @@ function queryDB(contractAddr) {
 }
 
 
-// For obtaining historical data of the contract
-app.get("/getHistory", async function(req, res) {
+// Responds to a URL query on tx history given a contract hash
+app.get("/getHistory", async (req, res) => {
   var contractAddr = req.query.chash;
 
   // if in our DB, go straight to DB
@@ -64,7 +65,7 @@ app.get("/getHistory", async function(req, res) {
   try {
     loadedData = await queryDB(contractAddr);
     var output = new Array();
-    loadedData.Items.forEach( function(item) {
+    loadedData.Items.forEach((item) => {
       var tx = {};
       tx.hash = item.txHash;
       tx.input = item.input;
@@ -78,16 +79,15 @@ app.get("/getHistory", async function(req, res) {
     res.send(output);
     console.log('taken from db - no. of txs: ' + output.length);
     return;
-  } 
-  catch(error) {
-    //console.error(error);
+  } catch(error) {
+    console.error(error);
   }
 
-
+  // quick address validity check
   if (!web3.utils.isAddress(contractAddr)) {
     console.error('Incorrect address cannot get history ' + contractAddr);
     res.status(404).end();
-    return; //??
+    return;
   }
   
   var contract;
@@ -102,7 +102,7 @@ app.get("/getHistory", async function(req, res) {
   // here if contract address is valid (but possibly a user address)
   contract.getPastEvents("allEvents", { 
     fromBlock: 0 //9991160
-    }, function (error, events) { 
+    }, (error, events) => { 
       //console.log(events);
       if (typeof events !== 'undefined') {
         getTransactionData(events, contractAddr, function(results) {
@@ -116,18 +116,13 @@ app.get("/getHistory", async function(req, res) {
   });
 });
 
-Number.prototype.pad = function(size) {
-    var s = String(this);
-    while (s.length < (size || 2)) {s = "0" + s;}
-    return s;
-}
-
 // Enter tx data into database
 function txToDatabase(tx, contractAddr) {
   var entry = {
     TableName: table,
     Item:{
       "contractHash": contractAddr,
+      //"sortKey": tx.blockNumber + tx.hash,
       "sortKey": tx.blockNumber.pad(8) + tx.hash,
       "txHash": tx.hash,
       "blockNumber": tx.blockNumber,
@@ -236,30 +231,21 @@ async function getTransactionData(events, contractAddr, callback) {
 }
 
 
-
-// Serving static files
-app.get("/result", function(req, res) {
-  res.sendFile(__dirname + "/result.html");
-}); // app.get("/result" ...
-
-app.get("/", function(req, res) {
-  res.sendFile(__dirname + "/index.html");
-});
-
-
 // For monitoring live updates on contract events 
 io.on('connection', (socket) => {
   socket.emit('hi', { hello: 'world' });
 
   // Client sends monitor request with contract address
   socket.on('contract', (data) => {
-    // Check contract address validity and load
     const contractAddr = data.chash;
+
+    // quick address validity check
     if (!web3.utils.isAddress(contractAddr)) {
       console.error('Incorrect address ' + contractAddr);
       terminate();
-      return; // ??
+      return;
     }
+
     var contract;
     try {
       contract = new web3.eth.Contract(abi, contractAddr);
@@ -269,25 +255,24 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Begin monitoring
+    // begin monitoring
     console.log('monitoring for tx ' + contractAddr);
     io.sockets.emit('monitoring start', {});
-    var seen = new Map(); // to prevent duplicate tx hashes
 
+    var seen = new Map(); // to prevent duplicate tx hashes
     var em = contract.events.allEvents(); //event emitter
     em.on('data', (event) => { 
         if (seen.has(event.transactionHash)) {
         } else {
           seen.set(event.transactionHash, 1);
-          // getTransactionData(events, contractAddr, callback)
           getTransactionData([event], contractAddr, function(results) {
-            //console.log(results[0]);
             io.sockets.emit('new tx', { message: results[0] });          
           });
         }
       })
       .on('error', console.error); 
 
+    // make sure to properly terminate all socket.io connections
     socket.on('disconnect', (reason) => {
       socket.disconnect(true);
       socket.removeAllListeners();
@@ -304,11 +289,28 @@ io.on('connection', (socket) => {
 }); // io.on('connect')
 
 
+
+// Serving static files
+app.get("/result", function(req, res) {
+  res.sendFile(__dirname + "/result.html");
+}); 
+
+app.get("/", function(req, res) {
+  res.sendFile(__dirname + "/index.html");
+});
+
 //app.listen(port, () =>
 //  console.log(`Server running at http://localhost:${port}`)
 //);
-
 const server = http.listen(port, () => {
   console.log(`Server running at http://localhost:${port}`)
 });
-//module.exports.handler = serverless(http);
+
+// misc. tools
+Number.prototype.pad = function(size) {
+  var s = String(this);
+  while (s.length < (size || 2)) {
+    s = "0" + s;
+  }
+  return s;
+}
