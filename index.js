@@ -3,7 +3,7 @@ const app = express();
 const http = require('http').Server(app);
 const io = require('socket.io')(http);
 
-const port = process.env.PORT || 4000;
+const port = process.env.PORT || 9000;
 
 const Web3 = require('web3');
 const rpcURL = "wss://mainnet.infura.io/ws/v3/02432d2e0aaf408189f15435d8fd561e";
@@ -116,13 +116,19 @@ app.get("/getHistory", async function(req, res) {
   });
 });
 
+Number.prototype.pad = function(size) {
+    var s = String(this);
+    while (s.length < (size || 2)) {s = "0" + s;}
+    return s;
+}
+
 // Enter tx data into database
 function txToDatabase(tx, contractAddr) {
   var entry = {
     TableName: table,
     Item:{
       "contractHash": contractAddr,
-      "sortKey": tx.blockNumber + tx.hash,
+      "sortKey": tx.blockNumber.pad(8) + tx.hash,
       "txHash": tx.hash,
       "blockNumber": tx.blockNumber,
       "timestamp": tx.timestamp,
