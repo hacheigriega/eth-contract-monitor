@@ -43,8 +43,9 @@
                     <th>Tx hash</th>
                     <th>From</th>
                     <th>To</th>
-                    <th>Block #</th>
-                    <th>Value (ETH)</th>
+                    <th>Function name</th>
+                    <th>Function params (name, value) pairs</th>
+                    <th>Timestamp</th>
                 </tr>
             </thead>
             <tbody id="historyTable">        
@@ -60,8 +61,6 @@
     <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.3.1/jquery.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/2.3.0/socket.io.js"></script>
     
-
-
     <script>
       var contract = { chash: getSearchParams("chash") };
       
@@ -78,7 +77,6 @@
             console.log(res);
             buildHistoryTable(res);
           }
-
         },
         error: function (jqXHR, textStatus, errorThrown) {
           alert("Cannot load contract information - Please check if the contract hash is valid (status: " + jqXHR.status + ")");
@@ -119,19 +117,40 @@
         table.innerHTML += row;
       }
 
+      
       function buildHistoryTable(data) {
         var table = document.getElementById('historyTable');
         for (var i = data.length - 1; i >= 0; i--) {
+
+          if (data[i].input) {
+            var params = paramsToText(data[i].input.params);
+            var fname = data[i].input.name;
+          } else {
+            params = undefined;
+            fname = undefined;
+          }
+          
           var row = `<tr>
                         <td>${data[i].hash}</td>
                         <td>${data[i].from}</td>
                         <td>${data[i].to}</td>
-                        <td>${data[i].blockNumber}</td>
-                        <td>${data[i].value}</td>
+                        <td>${fname}</td>
+                        <td>${params}</td>
+                        <td>${data[i].timestamp}</td>
                     </tr>`;
           table.innerHTML += row;
         }
       }
+
+      function paramsToText(params) {
+        var output = '';
+        for (var i = 0; i < params.length; i++) {
+          output += '(' + params[i].name + ', ' + params[i].value + ')<br>';
+        }
+        return output;
+      }
+      
+
       function getSearchParams(k) {
         var p = {};
         location.search.replace(/[?&]+([^=&]+)=([^&]*)/gi, function(s,k,v) {p[k]=v})
