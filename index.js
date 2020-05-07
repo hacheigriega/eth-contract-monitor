@@ -28,6 +28,126 @@ const docClient = new AWS.DynamoDB.DocumentClient({
 const table = "Transactions";
 
 
+// Responds to a URL query on tx history given a contract hash
+app.get("/getHistory", async (req, res) => {
+  var contractAddr = req.query.chash;
+
+  // try querying our DB first
+  // if exists, simply send data from DB (FIX: UPDATING DB)
+  var loadedData;
+  try {
+    loadedData = await queryDB(contractAddr);
+    var output = new Array();
+    loadedData.Items.forEach((item) => {
+      var tx = {};
+      tx.hash = item.txHash;
+      tx.input = item.input;
+      tx.blockNumber = item.blockNumber;
+      tx.timestamp = item.timestamp;
+      tx.from = item.from;
+      tx.to = item.to;
+      tx.value = item.value;
+      output.push(tx);
+    });
+    res.send(output);
+    console.log('taken from db - no. of txs: ' + output.length);
+    return;
+  } catch(error) {
+    console.error(error);
+  }
+
+  // quick address validity check
+  if (!web3.utils.isAddress(contractAddr)) {
+    console.error('Incorrect address cannot get history ' + contractAddr);
+    res.status(404).end();
+    return;
+  }
+  
+  contractLoader(abi, contractAddr) //load contract
+    .then(contract => getHistoryData(contract)) // get past events from web3
+    .then(events => getTransactionData(events, contractAddr)) // obtain detailed tx data
+    .then(results => { res.send(results); }) // send data to frontend
+    .catch((error) => { 
+      console.error('Error getting history ' + error); 
+      if (error == 'Error: Returned error: query returned more than 10000 results') 
+        res.status(204).end();
+    });
+});
+
+
+// For monitoring live updates on contract events 
+io.on('connection', (socket) => {
+  socket.emit('hi', { hello: 'world' });
+
+  // Client sends monitor request with contract address
+  socket.on('contract', (data) => {
+    // quick address validity check
+    const contractAddr = data.chash;
+    if (!web3.utils.isAddress(contractAddr)) {
+      console.error('Incorrect address ' + contractAddr);
+      terminate();
+      return;
+    }
+
+    // load contract and begin monitoring
+    var contract;
+    try {
+      contract = new web3.eth.Contract(abi, contractAddr);
+    }
+    catch(err) {
+      console.error('error encountered', err);
+      return;
+    }
+    console.log('monitoring for tx ' + contractAddr);
+    io.sockets.emit('monitoring start', {});
+
+    var seen = new Map(); // to prevent duplicate tx hashes
+    var em = contract.events.allEvents(); //event emitter
+    em.on('data', (event) => { 
+        if (seen.has(event.transactionHash)) {
+        } else {
+          seen.set(event.transactionHash, 1);
+          getTransactionData([event], contractAddr, function(results) {
+            io.sockets.emit('new tx', { message: results[0] });          
+          });
+        }
+      })
+      .on('error', console.error); 
+
+    // make sure to properly terminate all socket.io connections
+    socket.on('disconnect', (reason) => {
+      socket.disconnect(true);
+      socket.removeAllListeners();
+      em.removeAllListeners();
+      terminate();
+      console.log('socket.io disconnected');
+    });
+  }); // socket.on('contract' ...
+
+  function terminate() {
+    socket.removeAllListeners();
+  }
+}); // io.on('connect')
+
+
+// Serving static files
+app.get("/result", function(req, res) {
+  res.sendFile(__dirname + "/result.html");
+}); 
+
+app.get("/", function(req, res) {
+  res.sendFile(__dirname + "/index.html");
+});
+
+const server = http.listen(port, () => {
+  console.log(`Server running at http://localhost:${port}`)
+});
+
+
+//
+// Helper functions & misc. tools
+//
+
 // Makes a partition key (contractAddr) based query
 // Returns all txs in DB corresponding to the given contract
 function queryDB(contractAddr) {
@@ -66,7 +186,7 @@ function contractLoader(abi, contractAddr) {
 function getHistoryData(contract) {
   return new Promise((resolve, reject) => {
     contract.getPastEvents("allEvents", { fromBlock: 0 })
-      .then( (events) => {
+      .then((events) => {
         if (typeof events !== 'undefined') {
           resolve(events);
         } else {
@@ -75,60 +195,12 @@ function getHistoryData(contract) {
           res.status(204).end();
           return;
         }
-    });
+      })
+      .catch((error) => {
+        reject(error); 
+      });
   })
 }
-
-
-// Responds to a URL query on tx history given a contract hash
-app.get("/getHistory", async (req, res) => {
-  var contractAddr = req.query.chash;
-
-  // try querying our DB first
-  // if exists, simply send data from DB (FIX: UPDATING DB)
-  var loadedData;
-  try {
-    loadedData = await queryDB(contractAddr);
-    var output = new Array();
-    loadedData.Items.forEach((item) => {
-      var tx = {};
-      tx.hash = item.txHash;
-      tx.input = item.input;
-      tx.blockNumber = item.blockNumber;
-      tx.timestamp = item.timestamp;
-      tx.from = item.from;
-      tx.to = item.to;
-      tx.value = item.value;
-      output.push(tx);
-    });
-    res.send(output);
-    console.log('taken from db - no. of txs: ' + output.length);
-    return;
-  } catch(error) {
-    console.error(error);
-  }
-
-  // quick address validity check
-  if (!web3.utils.isAddress(contractAddr)) {
-    console.error('Incorrect address cannot get history ' + contractAddr);
-    res.status(404).end();
-    return;
-  }
-  
-  contractLoader(abi, contractAddr) //load contract
-    .then(contract => getHistoryData(contract)) // get past events from web3
-    .then(events => getTransactionData(events, contractAddr))
-    .then(results => { 
-      res.send(results); 
-      console.log(results.length + ' data sent to front');
-    })
-    .catch((error) => { console.error('Error getting history ' + error); });
-    //{ // populate tx data 
-    //  getTransactionData(events, contractAddr, (results) => { res.send(results); });
-    //});
-});
-
-
 
 
 // Enter tx data into database
@@ -137,7 +209,6 @@ function txToDatabase(tx, contractAddr) {
     TableName: table,
     Item:{
       "contractHash": contractAddr,
-      //"sortKey": tx.blockNumber + tx.hash,
       "sortKey": tx.blockNumber.pad(8) + tx.hash,
       "txHash": tx.hash,
       "blockNumber": tx.blockNumber,
@@ -189,165 +260,62 @@ function getABI(contractAddr) {
   } 
 }
 
-// Given a list of contractAddr and "events",
-// removes returns a list of tx data (with duplicates removed)
-async function getTransactionData(events, contractAddr) {
-
-  return getABI(contractAddr) //get contract ABI if necessary
-    .then(async () => {
-      // Obtain tx data, disregard duplicates
-      // To fix: Inefficient async structure?
-      var seen = new Map();
-      var seenBlock = new Map(); // blockNumber to timeStamp
-      var output = new Array();
-      for (var i = 0; i < events.length; i++) {
-        if (!seen.has(events[i].transactionHash)) {
-          seen.set(events[i].transactionHash, 1);  
-          
-          var tx = {};
-          await web3.eth.getTransaction(events[i].transactionHash)
-            .then((data) => {
-              tx.input = ABIDecoder.decodeMethod(data.input); // to obtain info about invoked function
-              tx.hash = data.hash;
-              tx.blockNumber = data.blockNumber;
-              tx.from = data.from;
-              tx.to = data.to;
-              tx.txIndex = data.transactionIndex;
-              tx.value = data.value/(10**18);
-            })
-            .then(async () => {
-              if (seenBlock.has(tx.blockNumber)) {
-                tx.timestamp = seenBlock.get(tx.blockNumber);
-              } else {
-                await web3.eth.getBlock(tx.blockNumber)
-                  .then(function(block) {
-                    //console.log(block);
-                    if (block) {
-                      var time = block.timestamp;
-                      var timec = new Date(time*1000);
-                      var timeStamp = timec.toUTCString();
-                      tx.timestamp = timeStamp;
-                      seenBlock.set(tx.blockNumber, timeStamp);
-                    } else {
-                      tx.timestamp = null;
-                    }
-                  }); 
-              }
-              txToDatabase(tx, contractAddr);
-              output.push(tx);
-            });
-        }
-      } // for each event / tx
-      
-      return new Promise((resolve, reject) => {
-        //console.log(output);
-        console.log('here resolving ' + output.length)
-        resolve(output);
-      })
-    })
-}
+// Obtains tx data, disregarding duplicates
+// FIX: Inefficient async structure?
+async function getTxData (events) {
+  var seen = new Map();
+  var seenBlock = new Map(); // blockNumber to timeStamp
+  var output = new Array();
+  for (var i = 0; i < events.length; i++) {
+    if (!seen.has(events[i].transactionHash)) {
+      seen.set(events[i].transactionHash, 1);  
+      var tx = {};
+      await web3.eth.getTransaction(events[i].transactionHash)
+        .then((data) => {
+          tx.input = ABIDecoder.decodeMethod(data.input); // to obtain info about invoked function
+          tx.hash = data.hash;
+          tx.blockNumber = data.blockNumber;
+          tx.from = data.from;
+          tx.to = data.to;
+          tx.txIndex = data.transactionIndex;
+          tx.value = data.value/(10**18);
+        })
+        .then(async () => {
+          if (seenBlock.has(tx.blockNumber)) {
+            tx.timestamp = seenBlock.get(tx.blockNumber);
+          } else {
+            await web3.eth.getBlock(tx.blockNumber)
+              .then(function(block) {
+                //console.log(block);
+                if (block) {
+                  var time = block.timestamp;
+                  var timec = new Date(time*1000);
+                  var timeStamp = timec.toUTCString();
+                  tx.timestamp = timeStamp;
+                  seenBlock.set(tx.blockNumber, timeStamp);
+                } else {
+                  tx.timestamp = null;
+                }
+              }); 
+          }
+          txToDatabase(tx, contractAddr);
+          output.push(tx);
+        });
+    }
+  } // for each event / tx
   
-  /*
-  // Obtain the contract's ABI, if we don't have it already
-  if (!ABISet.has(contractAddr)) {
-    ABISet.add(contractAddr);
-    console.log('etherscan query for ' + contractAddr);
-    getJSON('http://api.etherscan.io/api?module=contract&action=getabi&address=' + contractAddr)
-      .then(function(response) {
-        if (response.result != '') {
-          console.log('response from etherscan ' + response + ' ' + response.result);
-          ABIDecoder.addABI(eval(response.result));
-        } else {
-          console.log('Error while obtaining contract ABI for ' + contractAddr);
-        }
-      }).catch(function(error) {
-          //console.log(error);
-          console.log('error while obtaining abi for ' + contractAddr);
-      });  
-  }
-  ...
+  return new Promise((resolve, reject) => {
+    //console.log(output);
+    resolve(output);
+  })
+}
 
-  callback(output);
-  */
+// Returns detailed info about txs in "events"
+async function getTransactionData(events, contractAddr) {
+  return getABI(contractAddr) //get contract ABI if necessary
+    .then(() => getTxData(events)); // get detailed tx data
+}
 
-
-
-// For monitoring live updates on contract events 
-io.on('connection', (socket) => {
-  socket.emit('hi', { hello: 'world' });
-
-  // Client sends monitor request with contract address
-  socket.on('contract', (data) => {
-    const contractAddr = data.chash;
-
-    // quick address validity check
-    if (!web3.utils.isAddress(contractAddr)) {
-      console.error('Incorrect address ' + contractAddr);
-      terminate();
-      return;
-    }
-
-    var contract;
-    try {
-      contract = new web3.eth.Contract(abi, contractAddr);
-    }
-    catch(err) {
-      console.error('error encountered', err);
-      return;
-    }
-
-    // begin monitoring
-    console.log('monitoring for tx ' + contractAddr);
-    io.sockets.emit('monitoring start', {});
-
-    var seen = new Map(); // to prevent duplicate tx hashes
-    var em = contract.events.allEvents(); //event emitter
-    em.on('data', (event) => { 
-        if (seen.has(event.transactionHash)) {
-        } else {
-          seen.set(event.transactionHash, 1);
-          getTransactionData([event], contractAddr, function(results) {
-            io.sockets.emit('new tx', { message: results[0] });          
-          });
-        }
-      })
-      .on('error', console.error); 
-
-    // make sure to properly terminate all socket.io connections
-    socket.on('disconnect', (reason) => {
-      socket.disconnect(true);
-      socket.removeAllListeners();
-      em.removeAllListeners();
-      terminate();
-      console.log('socket.io disconnected');
-    });
-
-  }); // socket.on('contract' ...
-
-  function terminate() {
-    socket.removeAllListeners();
-  }
-}); // io.on('connect')
-
-
-
-// Serving static files
-app.get("/result", function(req, res) {
-  res.sendFile(__dirname + "/result.html");
-}); 
-
-app.get("/", function(req, res) {
-  res.sendFile(__dirname + "/index.html");
-});
-
-//app.listen(port, () =>
-//  console.log(`Server running at http://localhost:${port}`)
-//);
-const server = http.listen(port, () => {
-  console.log(`Server running at http://localhost:${port}`)
-});
-
-// misc. tools
 Number.prototype.pad = function(size) {
   var s = String(this);
   while (s.length < (size || 2)) {
