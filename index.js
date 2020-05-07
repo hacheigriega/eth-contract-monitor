@@ -67,7 +67,7 @@ app.get("/getHistory", async (req, res) => {
     .then(contract => getHistoryData(contract)) // get past events from web3
     .then(events => getTransactionData(events, contractAddr)) // obtain detailed tx data
     .then(results => { res.send(results); }) // send data to frontend
-    .catch((error) => { 
+    .catch(error => { 
       console.error('Error getting history ' + error); 
       if (error == 'Error: Returned error: query returned more than 10000 results') 
         res.status(204).end();
@@ -107,9 +107,12 @@ io.on('connection', (socket) => {
         if (seen.has(event.transactionHash)) {
         } else {
           seen.set(event.transactionHash, 1);
-          getTransactionData([event], contractAddr, function(results) {
-            io.sockets.emit('new tx', { message: results[0] });          
-          });
+          getTransactionData([event], contractAddr)
+            .then(results => { 
+              console.log('new tx ' + results);
+              io.sockets.emit('new tx', { message: results[0] }); 
+            })
+            .catch(error => { console.log('Error while live update tx fetch: ' + error); });
         }
       })
       .on('error', console.error); 
@@ -145,7 +148,11 @@ const server = http.listen(port, () => {
 
 
 //
-// Helper functions & misc. tools
+// helper functions & misc. tools
+//
+
+//
+// functions that return a promise
 //
 
 // Makes a partition key (contractAddr) based query
@@ -163,26 +170,30 @@ function queryDB(contractAddr) {
   };
 
   return new Promise((resolve, reject) => {
-    docClient.query(params, (error, data) => {
-      if (error || data.Count == 0) {
-        console.error('DB query failed for contract ' + contractAddr);
-        reject(Error('DB query caused an error or did not return any results'));
-      } else {
-        console.log('DB query succeeded.');
-        resolve(data);
-      }
-    });
+    docClient.query(params).promise()
+      .then(data => {
+        if (data.Count != 0) {
+          console.log('DB query succeeded.');
+          resolve(data);
+        } else {
+          reject('DB query did not return any results');
+        }
+      })
+      .catch(error => {
+        reject('DB query for ' + contractAddr + ' caused an error ' + error);
+      })
   });
 }
+
 
 function contractLoader(abi, contractAddr) {
   return new Promise((resolve, reject) => {
     var contract = new web3.eth.Contract(abi, contractAddr);
-    resolve(contract);
+    resolve(contract); // FIX: this or resolve inside then()?
   })
 }
 
-//
+// Retrieves past events from web3
 function getHistoryData(contract) {
   return new Promise((resolve, reject) => {
     contract.getPastEvents("allEvents", { fromBlock: 0 })
@@ -190,10 +201,7 @@ function getHistoryData(contract) {
         if (typeof events !== 'undefined') {
           resolve(events);
         } else {
-          //console.log("server failed at getting past events");
-          reject(events);
-          res.status(204).end();
-          return;
+          reject('getHistoryData resulted in undefined results');
         }
       })
       .catch((error) => {
@@ -202,8 +210,114 @@ function getHistoryData(contract) {
   })
 }
 
+// Adds a new ABI to ABIDecoder, if necessary.
+// FIX: not very scalable if dealing with a lot of contracts
+function getABI(contractAddr) {
+    return new Promise((resolve, reject) => {
+      if (ABISet.has(contractAddr)) {
+        resolve();
+      } else {
+        ABISet.add(contractAddr);
+        console.log('etherscan query for ' + contractAddr);
 
-// Enter tx data into database
+        getJSON('http://api.etherscan.io/api?module=contract&action=getabi&address=' + contractAddr)
+          .then((response) => {
+            if (response.result != '') {
+              console.log('response from etherscan ' + response + ' ' + response.result);
+              ABIDecoder.addABI(eval(response.result));
+              resolve();
+            } else {
+              console.log('Error while obtaining contract ABI for ' + contractAddr);
+              reject();
+            }
+          })
+          .catch((error) => {
+              console.log('Error while obtaining abi ' + error);
+              reject(error);
+          });
+      }
+    }); 
+}
+
+// Obtains tx data, disregarding duplicates
+// FIX: Inefficient async structure? Use Promise.all() instead?
+async function getTxData (events, contractAddr) {
+  var seen = new Map();
+  var seenBlock = new Map(); // blockNumber to timeStamp
+  var output = new Array();
+  for (var i = 0; i < events.length; i++) {
+    if (!seen.has(events[i].transactionHash)) {
+      console.log(events[i].transactionHash);
+      seen.set(events[i].transactionHash, 1);  
+      var tx = {};
+      await web3.eth.getTransaction(events[i].transactionHash)
+        .then((data) => {
+          tx.input = ABIDecoder.decodeMethod(data.input); // to obtain info about invoked function
+          tx.hash = data.hash;
+          tx.blockNumber = data.blockNumber;
+          tx.from = data.from;
+          tx.to = data.to;
+          tx.txIndex = data.transactionIndex;
+          tx.value = data.value/(10**18);
+          if (!tx.blockNumber)
+            tx.blockNumber = -1; // FIX: should later be updated
+        })
+        .then(async () => {
+          if (seenBlock.has(tx.blockNumber)) {
+            tx.timestamp = seenBlock.get(tx.blockNumber);
+          } else {
+            await web3.eth.getBlock(tx.blockNumber)
+              .then(block => {
+                if (block) {
+                  var time = block.timestamp;
+                  var timec = new Date(time*1000);
+                  var timeStamp = timec.toUTCString();
+                  tx.timestamp = timeStamp;
+                  seenBlock.set(tx.blockNumber, timeStamp);
+                } else {
+                  tx.timestamp = undefined;
+                }
+              })
+              .catch(error => {
+                console.log('Error loading block ' + error);
+                tx.timeStamp = undefined;
+              }); 
+          }
+          txToDatabase(tx, contractAddr);
+          output.push(tx);
+        })
+        .catch((error) => {
+          console.log('Error while obtaining tx data ' + error);
+        });
+    }
+  } // for each event / tx
+  
+  return new Promise((resolve, reject) => {
+    resolve(output);
+  })
+}
+
+// Returns detailed info about txs given "events"
+async function getTransactionData(events, contractAddr) {
+  return new Promise((resolve, reject) => {
+    getABI(contractAddr) //get contract ABI if necessary
+      .then(() => {
+        const result = getTxData(events, contractAddr);
+        resolve(result);
+      }) // get detailed tx data
+      .catch((error) => { 
+        console.log('getTransactionData level + ' + error);
+        reject(error); 
+      });
+  });
+}
+
+
+//
+// functions that do not return a promise
+//
+
+// Enters tx data into database
 function txToDatabase(tx, contractAddr) {
   var entry = {
     TableName: table,
@@ -217,103 +331,18 @@ function txToDatabase(tx, contractAddr) {
       "to": tx.to,
       "value": tx.value, 
       "input": tx.input
-    }//,
-    //ReturnValues: "ALL_OLD"
+    }
   };
 
-  docClient.put(entry, (err, data) => {
-    if (err) {
-      //console.error("Unable to add item to DB. Error JSON:", JSON.stringify(err, null, 2));
-      console.error("Error while adding tx hash: " + tx.hash);
-      console.error("tx blockNumber: " + tx.timestamp);
-    } else {
-      console.log("Added item to DB - tx: ", tx.hash);
-      console.log("Added item to DB - contract: ", contractAddr);
-      console.log("Added item to DB: ", JSON.stringify(data, null, 2));
-    }
-  });
-}
-
-function getABI(contractAddr) {
-  if (ABISet.has(contractAddr)) {
-    return;
-  } else {
-    ABISet.add(contractAddr);
-    console.log('etherscan query for ' + contractAddr);
-    return new Promise((resolve, reject) => {
-      getJSON('http://api.etherscan.io/api?module=contract&action=getabi&address=' + contractAddr)
-        .then((response) => {
-          if (response.result != '') {
-            console.log('response from etherscan ' + response + ' ' + response.result);
-            ABIDecoder.addABI(eval(response.result));
-            resolve();
-          } else {
-            console.log('Error while obtaining contract ABI for ' + contractAddr);
-            reject();
-          }
-        })
-        .catch((error) => {
-            console.log('Error while obtaining abi ' + error);
-            reject();
-        });
+  docClient.put(entry).promise()
+    .then(data => {
+      console.log("Added item to DB - tx ", tx.hash);
+      //console.log("Added item to DB - contract: ", contractAddr);
+      //console.log("Added item to DB: ", JSON.stringify(data, null, 2));
+    })
+    .catch(error => {
+      console.log('DB put for tx ' + tx + ' failed due to ' + error);
     });
-  } 
-}
-
-// Obtains tx data, disregarding duplicates
-// FIX: Inefficient async structure?
-async function getTxData (events) {
-  var seen = new Map();
-  var seenBlock = new Map(); // blockNumber to timeStamp
-  var output = new Array();
-  for (var i = 0; i < events.length; i++) {
-    if (!seen.has(events[i].transactionHash)) {
-      seen.set(events[i].transactionHash, 1);  
-      var tx = {};
-      await web3.eth.getTransaction(events[i].transactionHash)
-        .then((data) => {
-          tx.input = ABIDecoder.decodeMethod(data.input); // to obtain info about invoked function
-          tx.hash = data.hash;
-          tx.blockNumber = data.blockNumber;
-          tx.from = data.from;
-          tx.to = data.to;
-          tx.txIndex = data.transactionIndex;
-          tx.value = data.value/(10**18);
-        })
-        .then(async () => {
-          if (seenBlock.has(tx.blockNumber)) {
-            tx.timestamp = seenBlock.get(tx.blockNumber);
-          } else {
-            await web3.eth.getBlock(tx.blockNumber)
-              .then(function(block) {
-                //console.log(block);
-                if (block) {
-                  var time = block.timestamp;
-                  var timec = new Date(time*1000);
-                  var timeStamp = timec.toUTCString();
-                  tx.timestamp = timeStamp;
-                  seenBlock.set(tx.blockNumber, timeStamp);
-                } else {
-                  tx.timestamp = null;
-                }
-              }); 
-          }
-          txToDatabase(tx, contractAddr);
-          output.push(tx);
-        });
-    }
-  } // for each event / tx
-  
-  return new Promise((resolve, reject) => {
-    //console.log(output);
-    resolve(output);
-  })
-}
-
-// Returns detailed info about txs in "events"
-async function getTransactionData(events, contractAddr) {
-  return getABI(contractAddr) //get contract ABI if necessary
-    .then(() => getTxData(events)); // get detailed tx data
 }
 
 Number.prototype.pad = function(size) {
