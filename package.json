@@ -8,7 +8,7 @@
     "aws-sdk": "^2.669.0",
     "bootstrap": "^4.4.1",
     "get-json": "^1.0.1",
-    "socket.io": "^2.3.0",
+    "socket.io": "^2.4.0",
     "web3": "^1.2.7"
   },
   "devDependencies": {},
